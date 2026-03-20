@@ -12,7 +12,7 @@
 #include <sys/wait.h>
 #endif
 
-// Fase 1: Ejecutar el comando del sistema [cite: 49]
+// Fase 1: Ejecutar el comando del sistema
 void ejecutar_comando(const std::vector<std::string>& args_str) {
     if (args_str.empty()) return; // Si el usuario solo presiona Enter, no hace nada
 
