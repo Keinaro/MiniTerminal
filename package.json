@@ -1,0 +1,17 @@
+{
+  "name": "miniterminal-vue",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite --port 3030",
+    "build": "vite build",
+    "preview": "vite preview --port 3030"
+  },
+  "dependencies": {
+    "vue": "^3.4.21"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.4",
+    "vite": "^5.2.0"
+  }
+}
