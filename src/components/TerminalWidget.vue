@@ -39,7 +39,7 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick, onMounted } from 'vue'
+import { ref, computed, nextTick, onMounted, watch } from 'vue'
 import {
   vfsRoot, cwd, vfsLoaded, username,
   resolvePath, resolveCI, getNode, getParentAndName,
@@ -47,10 +47,20 @@ import {
 
 const emit = defineEmits(['process-event'])
 
+const backendEnabled   = ref(false)
+const backendSessionId = ref(null)
+const backendSyncNeeded = ref(true)
+const API_BASE = '/api'
+
 /* ─── Prompt dinámico ─────────────────────────────────────────
    Muestra: usuario@miniterminal:/path$
    La raíz (/) se muestra como el nombre de la carpeta cargada. */
 const promptLabel = computed(() => {
+  if (backendEnabled.value) {
+    const root = vfsRoot.name && vfsRoot.name !== '/' ? vfsRoot.name : '~'
+    const path = cwd.value === '/' ? '' : cwd.value
+    return `MiniTerminal_SyJ:${root}${path}>`
+  }
   const root = vfsRoot.name && vfsRoot.name !== '/' ? vfsRoot.name : '~'
   const path = cwd.value === '/' ? '' : cwd.value
   const display = root + path
@@ -375,6 +385,149 @@ async function runInBackground(cmdName, args, handler) {
   return { result, pid: childPid }
 }
 
+function pushBackendOutput(text) {
+  if (!text) return
+  const lines = text.replace(/\r/g, '').split('\n')
+  for (const l of lines) {
+    if (!l.trim()) continue
+    if (l.toLowerCase().includes('error')) {
+      outputLines.value.push({ type: 'error', text: l })
+    } else {
+      outputLines.value.push({ type: 'plain', text: l })
+    }
+  }
+}
+
+async function initBackendSession() {
+  try {
+    const res = await fetch(`${API_BASE}/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    })
+    if (!res.ok) throw new Error('No se pudo abrir sesion backend')
+    const data = await res.json()
+    backendSessionId.value = data.sessionId
+    backendEnabled.value = true
+    backendSyncNeeded.value = true
+    outputLines.value.push({ type: 'info', text: 'Motor C++ conectado (modo real)' })
+  } catch {
+    backendEnabled.value = false
+    outputLines.value.push({ type: 'info', text: 'Modo simulado activo (backend C++ no disponible)' })
+  }
+}
+
+function collectVfsEntries(node, prefix = '') {
+  const entries = []
+  const children = Object.values(node?.children ?? {})
+
+  for (const child of children) {
+    const childPath = prefix ? `${prefix}/${child.name}` : child.name
+    if (child.type === 'dir') {
+      entries.push({ path: childPath, type: 'dir' })
+      entries.push(...collectVfsEntries(child, childPath))
+    } else {
+      entries.push({
+        path: childPath,
+        type: 'file',
+        content: typeof child.content === 'string' ? child.content : '',
+      })
+    }
+  }
+
+  return entries
+}
+
+async function syncBackendVfsIfNeeded() {
+  if (!backendEnabled.value || !backendSessionId.value || !backendSyncNeeded.value) return
+
+  const entries = vfsLoaded.value ? collectVfsEntries(vfsRoot) : []
+
+  const res = await fetch(`${API_BASE}/sync-vfs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sessionId: backendSessionId.value,
+      entries,
+    }),
+  })
+
+  if (!res.ok) {
+    const txt = await res.text()
+    throw new Error(txt || 'Error sincronizando carpeta con backend')
+  }
+
+  backendSyncNeeded.value = false
+}
+
+async function runBackendCommand(rawInput) {
+  if (rawInput === 'clear') {
+    outputLines.value = []
+    await scrollBottom()
+    return
+  }
+
+  if (!backendSessionId.value) {
+    backendEnabled.value = false
+    return
+  }
+
+  // Mantiene el prompt visual sincronizado cuando se usa cd en modo backend.
+  const cdMatch = rawInput.match(/^\s*cd\s+(.+)\s*$/)
+  if (cdMatch) {
+    const targetRaw = cdMatch[1].trim()
+    const target = targetRaw === '' ? '/' : targetRaw
+    const resolved = resolveCI(cwd.value, target)
+    if (resolved && resolved.node.type === 'dir') {
+      cwd.value = resolved.path
+    }
+  }
+
+  processing.value = true
+  try {
+    await syncBackendVfsIfNeeded()
+
+    const res = await fetch(`${API_BASE}/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: backendSessionId.value, command: rawInput }),
+    })
+
+    if (!res.ok) {
+      const txt = await res.text()
+      outputLines.value.push({ type: 'error', text: txt || 'Error ejecutando comando en backend' })
+      return
+    }
+
+    const data = await res.json()
+    pushBackendOutput(data.output || '')
+    if (data.ended) {
+      backendEnabled.value = false
+      backendSessionId.value = null
+    }
+  } catch {
+    backendEnabled.value = false
+    outputLines.value.push({ type: 'error', text: 'Se perdio la conexion con el backend C++' })
+  } finally {
+    pushLine({ type: 'blank' })
+    processing.value = false
+    await scrollBottom()
+    await nextTick()
+    inputRef.value?.focus()
+  }
+}
+
+watch(vfsLoaded, () => {
+  backendSyncNeeded.value = true
+})
+
+watch(() => vfsRoot.name, () => {
+  backendSyncNeeded.value = true
+})
+
+watch(() => Object.keys(vfsRoot.children ?? {}).length, () => {
+  backendSyncNeeded.value = true
+})
+
 /* ─── Ejecución principal ─────────────────────────────────────── */
 function pushLine(line) {
   if (Array.isArray(line)) line.forEach(l => l && outputLines.value.push(l))
@@ -392,6 +545,11 @@ async function handleEnter() {
   if (cmdHistory.value[cmdHistory.value.length - 1] !== rawInput)
     cmdHistory.value.push(rawInput)
   histIdx.value = -1
+
+  if (backendEnabled.value) {
+    await runBackendCommand(rawInput)
+    return
+  }
 
   // Fase 7: segundo plano (&)
   const isBg = /\s*&\s*$/.test(rawInput)
@@ -573,6 +731,7 @@ onMounted(() => {
     { type: 'html',  text: `<span style="color:#8b949e">Escribe <span style="color:#7ee787">help</span> para ver todos los comandos.</span>` },
     { type: 'blank' },
   )
+  initBackendSession()
   nextTick(() => inputRef.value?.focus())
 })
 </script>

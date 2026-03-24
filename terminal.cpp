@@ -28,6 +28,12 @@ void mostrar_ayuda() {
     std::cout << "  history       - Muestra historial de la sesion\n";
     std::cout << "  cd <ruta>     - Cambia de directorio\n";
     std::cout << "  exit          - Cierra la terminal\n\n";
+    std::cout << "Comandos propios:\n";
+    std::cout << "  jorge         - Responde 'sofia'\n";
+    std::cout << "  sofia         - Responde 'jorge'\n";
+    std::cout << "  url           - Responde 'Universidad Rafael Landivar'\n";
+    std::cout << "  materia       - Responde 'Sistemas Operativos'\n";
+    std::cout << "  equipo        - Responde 'jorge y sofia'\n\n";
     std::cout << "Operadores soportados:\n";
     std::cout << "  |   Pipe entre dos o mas comandos\n";
     std::cout << "  >   Redireccion de salida\n";
@@ -104,6 +110,32 @@ void liberar_argv(char** argv, size_t n) {
         delete[] argv[i];
     }
     delete[] argv;
+}
+
+std::string reconstruir_linea(const std::vector<Comando>& comandos) {
+    std::ostringstream oss;
+
+    for (size_t i = 0; i < comandos.size(); ++i) {
+        const Comando& c = comandos[i];
+        for (size_t j = 0; j < c.args.size(); ++j) {
+            if (j > 0) oss << ' ';
+            oss << c.args[j];
+        }
+
+        if (!c.input_file.empty()) {
+            oss << " < " << c.input_file;
+        }
+
+        if (!c.output_file.empty()) {
+            oss << (c.append_output ? " >> " : " > ") << c.output_file;
+        }
+
+        if (i + 1 < comandos.size()) {
+            oss << " | ";
+        }
+    }
+
+    return oss.str();
 }
 
 #ifndef _WIN32
@@ -213,13 +245,17 @@ int ejecutar_pipeline_posix(const std::vector<Comando>& comandos) {
 #endif
 
 #ifdef _WIN32
-int ejecutar_comando_windows(const Comando& comando) {
-    if (comando.args.empty()) return 0;
-
-    if (!comando.input_file.empty() || !comando.output_file.empty()) {
-        std::cerr << "Redirecciones no soportadas en este build de Windows. Usa WSL/Linux para Fase 4 real.\n";
+int ejecutar_linea_windows_cmd(const std::string& linea) {
+    int estado = _spawnlp(_P_WAIT, "cmd", "cmd", "/c", linea.c_str(), nullptr);
+    if (estado == -1) {
+        std::cerr << "Error al ejecutar comando en cmd: " << std::strerror(errno) << "\n";
         return 1;
     }
+    return estado;
+}
+
+int ejecutar_comando_windows(const Comando& comando) {
+    if (comando.args.empty()) return 0;
 
     size_t n = comando.args.size();
     char** args = new char*[n + 1];
@@ -248,10 +284,16 @@ int ejecutar_comandos(const std::vector<Comando>& comandos) {
     if (comandos.empty()) return 0;
 
 #ifdef _WIN32
-    if (comandos.size() > 1) {
-        std::cerr << "Pipes no soportados en este build de Windows. Usa WSL/Linux para Fase 3 real.\n";
-        return 1;
+    bool requiere_cmd = (comandos.size() > 1);
+    if (!requiere_cmd) {
+        const Comando& c = comandos[0];
+        requiere_cmd = !c.input_file.empty() || !c.output_file.empty();
     }
+
+    if (requiere_cmd) {
+        return ejecutar_linea_windows_cmd(reconstruir_linea(comandos));
+    }
+
     return ejecutar_comando_windows(comandos[0]);
 #else
     return ejecutar_pipeline_posix(comandos);
@@ -316,6 +358,31 @@ int main() {
 #endif
                     std::cerr << "cd: " << std::strerror(errno) << "\n";
                 }
+                continue;
+            }
+
+            if (cmd == "jorge") {
+                std::cout << "sofia\n";
+                continue;
+            }
+
+            if (cmd == "sofia") {
+                std::cout << "jorge\n";
+                continue;
+            }
+
+            if (cmd == "url") {
+                std::cout << "Universidad Rafael Landivar\n";
+                continue;
+            }
+
+            if (cmd == "materia") {
+                std::cout << "Sistemas Operativos\n";
+                continue;
+            }
+
+            if (cmd == "equipo") {
+                std::cout << "jorge y sofia\n";
                 continue;
             }
         }
