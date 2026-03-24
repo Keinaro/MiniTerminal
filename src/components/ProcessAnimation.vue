@@ -48,6 +48,8 @@
 
             <!-- Indicador de pipe entre hijos -->
             <div v-if="child.pipeFrom" class="pipe-tag">📤 PIPE ←</div>
+            <!-- Indicador de proceso en segundo plano -->
+            <div v-if="child.isBackground" class="bg-tag">🌙 BG</div>
           </div>
         </div>
       </TransitionGroup>
@@ -230,6 +232,18 @@ function handleEvent(ev) {
       doneSteps.add('exec')
       addLog('wait', '⏳',
         `PID <span class="hl-pid">${ev.pid}</span> llama <b>wait()</b> — esperando a PID <span class="hl-pid">${ev.waitFor}</span>`)
+      break
+    }
+
+    case 'background-start': {
+      // Fase 7: padre NO llama wait(), sigue activo
+      shell.state = 'running'
+      const bgChild = children.find(c => c.pid === ev.pid)
+      if (bgChild) bgChild.isBackground = true
+      currentStep.value = 'running'
+      doneSteps.add('exec')
+      addLog('run', '🔀',
+        `<b>Sin wait()</b> — PID <span class="hl-pid">${ev.shellPid}</span> continúa, PID <span class="hl-pid">${ev.pid}</span> corre en <b>segundo plano</b>`)
       break
     }
 
@@ -488,6 +502,18 @@ function handleEvent(ev) {
   font-size: 0.55rem;
   color: #79c0ff;
   background: rgba(88,166,255,.1);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* Background tag */
+.bg-tag {
+  position: absolute;
+  bottom: 4px;
+  right: 6px;
+  font-size: 0.55rem;
+  color: #a5d6ff;
+  background: rgba(165,214,255,.12);
   padding: 1px 5px;
   border-radius: 4px;
 }
