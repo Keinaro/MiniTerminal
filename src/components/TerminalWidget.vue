@@ -459,6 +459,133 @@ async function syncBackendVfsIfNeeded() {
   backendSyncNeeded.value = false
 }
 
+function applyBackendSnapshot(entries) {
+  const root = { type: 'dir', name: vfsRoot.name || '/', children: {}, modified: '' }
+
+  const sorted = [...entries].sort((a, b) => a.path.split('/').length - b.path.split('/').length)
+
+  for (const e of sorted) {
+    if (!e || typeof e.path !== 'string' || typeof e.type !== 'string') continue
+
+    const parts = e.path.split('/').filter(Boolean)
+    if (!parts.length) continue
+
+    let node = root
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]
+      const isLast = i === parts.length - 1
+
+      if (isLast) {
+        if (e.type === 'dir') {
+          if (!node.children[part]) {
+            node.children[part] = { type: 'dir', name: part, children: {}, modified: '' }
+          }
+        } else {
+          node.children[part] = {
+            type: 'file',
+            name: part,
+            content: typeof e.content === 'string' ? e.content : '',
+            size: typeof e.content === 'string' ? e.content.length : 0,
+            modified: '',
+          }
+        }
+      } else {
+        if (!node.children[part] || node.children[part].type !== 'dir') {
+          node.children[part] = { type: 'dir', name: part, children: {}, modified: '' }
+        }
+        node = node.children[part]
+      }
+    }
+  }
+
+  vfsRoot.children = root.children
+  if (entries.length > 0) {
+    vfsLoaded.value = true
+  }
+}
+
+async function refreshFromBackendSnapshot() {
+  if (!backendEnabled.value || !backendSessionId.value) return
+
+  const res = await fetch(`${API_BASE}/snapshot`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId: backendSessionId.value }),
+  })
+
+  if (!res.ok) return
+  const data = await res.json()
+  if (Array.isArray(data.entries)) {
+    applyBackendSnapshot(data.entries)
+    backendSyncNeeded.value = false
+  }
+}
+
+function parseBackendCommandNames(rawInput) {
+  return rawInput
+    .split('|')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(part => part.split(/\s+/).filter(Boolean)[0] || 'cmd')
+}
+
+async function emitBackendStartEvents(rawInput) {
+  const shellPid = 1
+  const names = parseBackendCommandNames(rawInput)
+
+  if (names.length <= 1) {
+    const childPid = ++pidCounter
+    emit('process-event', { type: 'fork', pid: childPid, ppid: shellPid, command: names[0] || 'cmd', args: [] })
+    await delay(180)
+    emit('process-event', { type: 'exec', pid: childPid, command: names[0] || 'cmd', args: [] })
+    await delay(140)
+    emit('process-event', { type: 'wait', pid: shellPid, waitFor: childPid })
+    emit('process-event', { type: 'running', pid: childPid, command: names[0] || 'cmd' })
+    return { shellPid, pids: [childPid], names, pipe: false }
+  }
+
+  const pids = names.map(() => ++pidCounter)
+  for (let i = 0; i < pids.length; i++) {
+    emit('process-event', {
+      type: 'fork',
+      pid: pids[i],
+      ppid: shellPid,
+      command: names[i],
+      pipe: true,
+      ...(i > 0 ? { pipeFrom: pids[i - 1] } : {}),
+    })
+    await delay(120)
+  }
+
+  for (let i = 0; i < pids.length; i++) {
+    emit('process-event', { type: 'exec', pid: pids[i], command: names[i] })
+    await delay(90)
+  }
+
+  emit('process-event', { type: 'wait', pid: shellPid, waitFor: pids[0] })
+  if (pids.length >= 2) {
+    emit('process-event', { type: 'pipe-running', pid1: pids[0], pid2: pids[1] })
+  }
+  emit('process-event', { type: 'running', pid: pids[pids.length - 1], command: names[pids.length - 1] })
+  return { shellPid, pids, names, pipe: true }
+}
+
+async function emitBackendEndEvents(ctx, exitCode = 0) {
+  if (!ctx || !ctx.pids?.length) return
+
+  for (let i = 0; i < ctx.pids.length; i++) {
+    emit('process-event', {
+      type: 'exit',
+      pid: ctx.pids[i],
+      exitCode,
+      command: ctx.names?.[i] || 'cmd',
+    })
+    await delay(110)
+  }
+
+  emit('process-event', { type: 'resume', pid: ctx.shellPid ?? 1 })
+}
+
 async function runBackendCommand(rawInput) {
   if (rawInput === 'clear') {
     outputLines.value = []
@@ -483,8 +610,11 @@ async function runBackendCommand(rawInput) {
   }
 
   processing.value = true
+  let processCtx = null
+  let exitCode = 0
   try {
     await syncBackendVfsIfNeeded()
+    processCtx = await emitBackendStartEvents(rawInput)
 
     const res = await fetch(`${API_BASE}/execute`, {
       method: 'POST',
@@ -494,6 +624,7 @@ async function runBackendCommand(rawInput) {
 
     if (!res.ok) {
       const txt = await res.text()
+      exitCode = 1
       outputLines.value.push({ type: 'error', text: txt || 'Error ejecutando comando en backend' })
       return
     }
@@ -503,11 +634,16 @@ async function runBackendCommand(rawInput) {
     if (data.ended) {
       backendEnabled.value = false
       backendSessionId.value = null
+      await initBackendSession()
+    } else {
+      await refreshFromBackendSnapshot()
     }
   } catch {
+    exitCode = 1
     backendEnabled.value = false
     outputLines.value.push({ type: 'error', text: 'Se perdio la conexion con el backend C++' })
   } finally {
+    await emitBackendEndEvents(processCtx, exitCode)
     pushLine({ type: 'blank' })
     processing.value = false
     await scrollBottom()

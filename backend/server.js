@@ -116,11 +116,15 @@ class ShellSession {
 
   readUntilPrompt(timeoutMs = 8000) {
     return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timer: null };
       const timer = setTimeout(() => {
+        const idx = this.waiters.indexOf(waiter);
+        if (idx !== -1) this.waiters.splice(idx, 1);
         reject(new Error('Timeout esperando prompt del shell C++'));
       }, timeoutMs);
 
-      this.waiters.push({ resolve, reject, timer });
+      waiter.timer = timer;
+      this.waiters.push(waiter);
       this.flushWaiters();
     });
   }
@@ -151,8 +155,21 @@ class ShellSession {
       return { output: out.trimEnd(), ended: true };
     }
 
-    const output = await this.readUntilPrompt(10000);
-    return { output: output.trimEnd(), ended: false };
+    try {
+      const output = await this.readUntilPrompt(10000);
+      return { output: output.trimEnd(), ended: false };
+    } catch (err) {
+      if (String(err.message || err).includes('Timeout esperando prompt')) {
+        // Comandos interactivos (ej. cat > archivo) bloquean sin TTY.
+        // Reiniciamos la sesión para evitar que quede colgada.
+        this.close();
+        return {
+          output: 'Comando interactivo no soportado en modo web (requiere entrada continua). Usa echo "texto" > archivo.txt o cat < archivo.txt.',
+          ended: true,
+        };
+      }
+      throw err;
+    }
   }
 
   close() {
@@ -169,6 +186,41 @@ class ShellSession {
 }
 
 const sessions = new Map();
+
+function buildSnapshotEntries(baseDir) {
+  const entries = [];
+
+  function walk(currentDir, relPrefix) {
+    const items = fs.readdirSync(currentDir, { withFileTypes: true });
+    for (const item of items) {
+      const relPath = relPrefix ? `${relPrefix}/${item.name}` : item.name;
+      const absPath = path.join(currentDir, item.name);
+
+      if (item.isDirectory()) {
+        entries.push({ path: relPath, type: 'dir' });
+        walk(absPath, relPath);
+        continue;
+      }
+
+      if (item.isFile()) {
+        let content = '';
+        try {
+          const stat = fs.statSync(absPath);
+          if (stat.size <= 512 * 1024) {
+            content = fs.readFileSync(absPath, 'utf8');
+          }
+        } catch {
+          content = '';
+        }
+
+        entries.push({ path: relPath, type: 'file', content });
+      }
+    }
+  }
+
+  walk(baseDir, '');
+  return entries;
+}
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, sessions: sessions.size });
@@ -208,7 +260,9 @@ app.post('/execute', async (req, res) => {
     }
     return res.json(result);
   } catch (err) {
-    sessions.delete(sessionId);
+    if (session.closed) {
+      sessions.delete(sessionId);
+    }
     return res.status(500).json({ error: String(err.message || err) });
   }
 });
@@ -228,6 +282,26 @@ app.post('/sync-vfs', async (req, res) => {
   try {
     await session.syncVfs(entries);
     return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+app.post('/snapshot', (req, res) => {
+  const { sessionId } = req.body || {};
+
+  if (!sessionId || typeof sessionId !== 'string') {
+    return res.status(400).json({ error: 'sessionId requerido' });
+  }
+
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'Sesion no encontrada' });
+  }
+
+  try {
+    const entries = buildSnapshotEntries(session.workDir);
+    return res.json({ entries });
   } catch (err) {
     return res.status(500).json({ error: String(err.message || err) });
   }
